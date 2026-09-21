@@ -103,6 +103,7 @@ KBS_SMOKE_PATH="${KBS_SMOKE_PATH:-default/peerpod/smoke}"
 TRUSTEE_OPERATOR_SRC="${TRUSTEE_OPERATOR_SRC:-${WORKSPACE}/confidential-containers/trustee-operator}"
 KBS_PORT="${KBS_PORT:-8080}"
 KBS_URL="${KBS_URL:-}"
+AA_KBC_PARAMS="${AA_KBC_PARAMS:-}"
 
 SP_FILE="${SP_FILE:-${OUTPUT_DIR}/${INSTANCE_NAME}-peerpods-sp.json}"
 CREATE_SP="${CREATE_SP:-1}"
@@ -158,6 +159,7 @@ KBS_SMOKE_GUEST_PATH=/run/confidential-containers/cdh/kbs/peerpod/smoke
 TRUSTEE_OPERATOR_SRC="${TRUSTEE_OPERATOR_SRC:-}"
 KBS_URL="${KBS_URL:-}"
 KBS_PORT="${KBS_PORT:-8080}"
+AA_KBC_PARAMS="${AA_KBC_PARAMS:-}"
 
 PRIVATE_IP="${PRIVATE_IP:-}"
 SUBNET_CIDR="${SUBNET_CIDR:-}"
@@ -548,6 +550,11 @@ DISABLECVM=${DISABLECVM}
 USE_PUBLIC_IP=${USE_PUBLIC_IP_BOOL}
 TAGS=${PEERPODS_TAGS}
 EOF
+
+if [ "${USE_TRUSTEE}" = "1" ] && [ -n "${KBS_URL}" ]; then
+    AA_KBC_PARAMS_VAL="${AA_KBC_PARAMS:-cc_kbc::${KBS_URL}}"
+    echo "AA_KBC_PARAMS=${AA_KBC_PARAMS_VAL}" | sudo tee -a "${PEERPODS_CONF_DIR}/peer-pods.env" > /dev/null
+fi
 
 if [ -n "${INITDATA}" ]; then
     echo "INITDATA=${INITDATA}" | sudo tee -a "${PEERPODS_CONF_DIR}/peer-pods.env" > /dev/null
@@ -1156,7 +1163,7 @@ if ! ssh "${SSH_OPTS[@]}" -t "${ADMIN_USER}@${EXTERNAL_IP}" \
      USE_TRUSTEE='${USE_TRUSTEE}' TRUSTEE_OPERATOR_SRC='${TRUSTEE_OPERATOR_SRC}' \
      PRIVATE_IP='${PRIVATE_IP}' \
      TEST_ATTESTATION='${TEST_ATTESTATION}' KBS_SMOKE_PATH='${KBS_SMOKE_PATH}' \
-     KBS_URL='${KBS_URL}' KBS_PORT='${KBS_PORT}' SUBNET_CIDR='${SUBNET_CIDR}' \
+     KBS_URL='${KBS_URL}' KBS_PORT='${KBS_PORT}' AA_KBC_PARAMS='${AA_KBC_PARAMS}' SUBNET_CIDR='${SUBNET_CIDR}' \
      bash /tmp/setup-peerpods.sh"; then
     echo "------------------------------------------------------"
     echo "ERROR: failed on '${INSTANCE_NAME}'." >&2
