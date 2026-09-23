@@ -76,8 +76,23 @@ OUTPUT_DIR="${OUTPUT_DIR:-$HOME}"
 IP_FILE="${OUTPUT_DIR}/${INSTANCE_NAME}-external-ip"
 WORKSPACE="${WORKSPACE:-/workspace}"
 
+COCO_COMMUNITY_GALLERY="${COCO_COMMUNITY_GALLERY:-cococommunity-42d8482d-92cd-415b-b332-7648bd978eff}"
+PODVM_IMAGE_DEF_SRC="${PODVM_IMAGE_DEF_SRC:-peerpod-podvm-fedora}"
+PODVM_IMAGE_VER_SRC="${PODVM_IMAGE_VER_SRC:-0.17.0}"
+PODVM_SOURCE_REGION="${PODVM_SOURCE_REGION:-eastus}"
+
+PODVM_GALLERY="${PODVM_GALLERY:-${RESOURCE_GROUP}_podvm_gallery}"
+PODVM_IMAGE_DEF="${PODVM_IMAGE_DEF:-podvm-cvm-snp}"
+PODVM_IMAGE_VERSION="${PODVM_IMAGE_VERSION:-${PODVM_IMAGE_VER_SRC}}"
+
+PODVM_LOCAL_GALLERY="${PODVM_LOCAL_GALLERY:-${RESOURCE_GROUP}_podvm_local_gallery}"
+PODVM_LOCAL_IMAGE_DEF="${PODVM_LOCAL_IMAGE_DEF:-podvm-local}"
+
+PODVM_IMAGE_ID="${PODVM_IMAGE_ID:-}"
+
 TEST_POD_NAME="${TEST_POD_NAME:-llm-sealed-env}"
 TEST_POD_TIMEOUT="${TEST_POD_TIMEOUT:-600}"
+KEEP_TEST_POD="${KEEP_TEST_POD:-0}"
 
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="${HOME}/.ssh/known_hosts" -o ConnectTimeout=15)
 [ -f "${SSH_KEY}" ] && SSH_OPTS+=(-i "${SSH_KEY}")
@@ -93,6 +108,9 @@ set -euo pipefail
 WORKSPACE="${WORKSPACE:-/workspace}"
 TEST_POD_NAME="${TEST_POD_NAME:-llm-sealed-env}"
 TEST_POD_TIMEOUT="${TEST_POD_TIMEOUT:-600}"
+KEEP_TEST_POD="${KEEP_TEST_POD:-0}"
+PODVM_IMAGE_ID="${PODVM_IMAGE_ID:-}"
+PEERPODS_CONF_DIR=/etc/peer-pods
 CAA_SOCKET=/run/peerpod/hypervisor.sock
 TRUSTEE_NS=trustee-operator-system
 KBS_DEPLOYMENT=trustee-deployment
@@ -135,6 +153,23 @@ if ! k -n "${TRUSTEE_NS}" get deployment "${KBS_DEPLOYMENT}" >/dev/null 2>&1; th
 fi
 
 echo "  ok: cloud-api-adaptor and Trustee KBS are active."
+
+# Ensure peer-pods.env uses specified PODVM_IMAGE_ID if provided
+if [ -n "${PODVM_IMAGE_ID}" ] && sudo test -f "${PEERPODS_CONF_DIR}/peer-pods.env"; then
+    CURRENT_IMAGE_ID="$(sudo sed -n 's/^AZURE_IMAGE_ID=//p' "${PEERPODS_CONF_DIR}/peer-pods.env" || true)"
+    if [ "${CURRENT_IMAGE_ID}" != "${PODVM_IMAGE_ID}" ]; then
+        log "Updating AZURE_IMAGE_ID in ${PEERPODS_CONF_DIR}/peer-pods.env"
+        echo "  Old: ${CURRENT_IMAGE_ID}"
+        echo "  New: ${PODVM_IMAGE_ID}"
+        sudo sed -i "s|^AZURE_IMAGE_ID=.*|AZURE_IMAGE_ID=${PODVM_IMAGE_ID}|" "${PEERPODS_CONF_DIR}/peer-pods.env"
+        if ! sudo grep -q "^AZURE_IMAGE_ID=" "${PEERPODS_CONF_DIR}/peer-pods.env" 2>/dev/null; then
+            echo "AZURE_IMAGE_ID=${PODVM_IMAGE_ID}" | sudo tee -a "${PEERPODS_CONF_DIR}/peer-pods.env" > /dev/null
+        fi
+        log "Restarting cloud-api-adaptor.service to apply PODVM_IMAGE_ID"
+        sudo systemctl restart cloud-api-adaptor.service
+        sleep 3
+    fi
+fi
 
 if ! python3 -c "import cryptography" >/dev/null 2>&1; then
     log "Installing python3-cryptography..."
@@ -361,7 +396,7 @@ spec:
             sealed.*) echo "sealed-secret check: STILL_SEALED"; exit 1 ;;
             *) echo "sealed-secret check: UNSEALED" ;;
           esac
-          sleep 10
+          sleep infinity
       env:
         - name: OPENAI_API_KEY
           valueFrom:
@@ -376,7 +411,35 @@ k wait --for=condition=Ready "pod/${TEST_POD_NAME}" -n default --timeout="${TEST
 
 sleep 5
 
-# --- 9. Display Pod Logs & Verify Unsealing ---
+# --- 9. Verify Image ID Matching & Pod Logs ---
+
+log "Verifying CAA daemon logs for Pod VM image ID usage"
+sudo journalctl -u cloud-api-adaptor.service --no-pager -n 500 | grep -iE 'CreateInstance|image_id|ImageID|Creating instance' || true
+
+if [ -n "${PODVM_IMAGE_ID}" ]; then
+    log "Asserting daemon ImageID match against PODVM_IMAGE_ID"
+
+    ACTIVE_DAEMON_IMAGE="$(sudo journalctl -u cloud-api-adaptor.service --no-pager | grep 'ImageID:' | tail -1 | python3 -c '
+import sys, re
+line = sys.stdin.read()
+m = re.search(r"ImageID:([^\s\}]+)", line)
+print(m.group(1) if m else "")
+' || true)"
+
+    if [ -z "${ACTIVE_DAEMON_IMAGE}" ] && sudo test -f "${PEERPODS_CONF_DIR}/peer-pods.env"; then
+        ACTIVE_DAEMON_IMAGE="$(sudo sed -n 's/^AZURE_IMAGE_ID=//p' "${PEERPODS_CONF_DIR}/peer-pods.env" | tr -d '\r\n')"
+    fi
+
+    echo "  Expected PODVM_IMAGE_ID : ${PODVM_IMAGE_ID}"
+    echo "  Daemon Active Image ID  : ${ACTIVE_DAEMON_IMAGE}"
+
+    if [ "${ACTIVE_DAEMON_IMAGE}" != "${PODVM_IMAGE_ID}" ]; then
+        echo "ERROR: Image ID used by CAA daemon (${ACTIVE_DAEMON_IMAGE}) does NOT match PODVM_IMAGE_ID (${PODVM_IMAGE_ID})!" >&2
+        exit 1
+    else
+        echo "  SUCCESS: Confirmed daemon launched Pod VM using exact PODVM_IMAGE_ID."
+    fi
+fi
 
 log "Logs from Confidential Pod '${TEST_POD_NAME}':"
 echo "------------------------------------------------------"
@@ -395,7 +458,15 @@ else
     exit 1
 fi
 
-k delete pod "${TEST_POD_NAME}" -n default --ignore-not-found --wait || true
+if [ "${KEEP_TEST_POD}" = "1" ]; then
+    echo
+    echo "KEEP_TEST_POD=1; leaving '${TEST_POD_NAME}' running."
+else
+    echo
+    echo "Deleting pod '${TEST_POD_NAME}'..."
+    k delete pod "${TEST_POD_NAME}" -n default --ignore-not-found --wait || true
+fi
+
 REMOTE_SCRIPT
 }
 
@@ -409,12 +480,14 @@ az account show > /dev/null 2>&1 || fail "not logged in to Azure. Run 'az login'
 EXTERNAL_IP=""
 if az account show > /dev/null 2>&1; then
     echo "Looking up '${INSTANCE_NAME}' in resource group '${RESOURCE_GROUP}'..."
-    EXTERNAL_IP=$(az vm show \
+    VM_JSON=$(az vm show \
         --resource-group "${RESOURCE_GROUP}" \
         --name "${INSTANCE_NAME}" \
         --show-details \
-        --query "publicIps" \
-        --output tsv 2>/dev/null || true)
+        --output json 2>/dev/null || true)
+
+    AZURE_REGION=$(echo "${VM_JSON}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["location"])' 2>/dev/null || true)
+    EXTERNAL_IP=$(echo "${VM_JSON}" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("publicIps") or "")' 2>/dev/null || true)
 fi
 
 if [ -z "${EXTERNAL_IP}" ] && [ -f "${IP_FILE}" ]; then
@@ -427,6 +500,73 @@ if [ -z "${EXTERNAL_IP}" ]; then
 fi
 
 echo "Target: ${ADMIN_USER}@${EXTERNAL_IP}"
+
+# --- Resolve the pod VM image ---
+
+echo
+COMMUNITY_IMAGE_ID="/CommunityGalleries/${COCO_COMMUNITY_GALLERY}/Images/${PODVM_IMAGE_DEF_SRC}/Versions/${PODVM_IMAGE_VER_SRC}"
+
+if [ -n "${PODVM_IMAGE_ID}" ]; then
+    echo "Using the pod VM image given in PODVM_IMAGE_ID:"
+    echo "  ${PODVM_IMAGE_ID}"
+else
+    PODVM_LOCAL_VERSION=$(az sig image-version list \
+        --resource-group "${RESOURCE_GROUP}" \
+        --gallery-name "${PODVM_LOCAL_GALLERY}" \
+        --gallery-image-definition "${PODVM_LOCAL_IMAGE_DEF}" \
+        --query "sort_by([?provisioningState=='Succeeded'].{n:name,p:publishingProfile.publishedDate},&p)[-1].n" \
+        --output tsv 2>/dev/null || true)
+    [ "${PODVM_LOCAL_VERSION}" = "None" ] && PODVM_LOCAL_VERSION=""
+
+    if [ -n "${PODVM_LOCAL_VERSION}" ]; then
+        PODVM_GALLERY="${PODVM_LOCAL_GALLERY}"
+        PODVM_IMAGE_DEF="${PODVM_LOCAL_IMAGE_DEF}"
+        PODVM_IMAGE_VERSION="${PODVM_LOCAL_VERSION}"
+        echo "Found a locally built pod VM image; preferring it over the community one."
+    else
+        echo "No image in ${PODVM_LOCAL_GALLERY}/${PODVM_LOCAL_IMAGE_DEF}; using community image."
+    fi
+
+    echo "Looking for ${PODVM_GALLERY}/${PODVM_IMAGE_DEF}/${PODVM_IMAGE_VERSION}..."
+    PODVM_IMAGE_ID=$(az sig image-version show \
+        --resource-group "${RESOURCE_GROUP}" \
+        --gallery-name "${PODVM_GALLERY}" \
+        --gallery-image-definition "${PODVM_IMAGE_DEF}" \
+        --gallery-image-version "${PODVM_IMAGE_VERSION}" \
+        --query id --output tsv 2>/dev/null || true)
+
+    if [ -n "${PODVM_IMAGE_ID}" ]; then
+        REPLICATED_REGIONS=$(az sig image-version show \
+            --resource-group "${RESOURCE_GROUP}" \
+            --gallery-name "${PODVM_GALLERY}" \
+            --gallery-image-definition "${PODVM_IMAGE_DEF}" \
+            --gallery-image-version "${PODVM_IMAGE_VERSION}" \
+            --query "publishingProfile.targetRegions[].name" --output tsv 2>/dev/null \
+            | tr -d ' ' | tr '[:upper:]' '[:lower:]' || true)
+
+        if [ -n "${AZURE_REGION:-}" ] && ! printf '%s\n' "${REPLICATED_REGIONS}" | grep -Fxq "${AZURE_REGION}"; then
+            echo "  adding ${AZURE_REGION} to replication targets..."
+            TARGET_REGIONS=$(printf '%s\n%s\n' "${REPLICATED_REGIONS}" "${AZURE_REGION}" \
+                | sort -u | tr '\n' ' ')
+            # shellcheck disable=SC2086
+            az sig image-version update \
+                --resource-group "${RESOURCE_GROUP}" \
+                --gallery-name "${PODVM_GALLERY}" \
+                --gallery-image-definition "${PODVM_IMAGE_DEF}" \
+                --gallery-image-version "${PODVM_IMAGE_VERSION}" \
+                --target-regions ${TARGET_REGIONS} \
+                --output none \
+                || fail "could not replicate ${PODVM_IMAGE_VERSION} to ${AZURE_REGION}."
+        fi
+    else
+        [ -n "${PODVM_LOCAL_VERSION}" ] \
+            && fail "${PODVM_GALLERY}/${PODVM_IMAGE_DEF}/${PODVM_IMAGE_VERSION} was listed but cannot be read."
+        PODVM_IMAGE_ID="${COMMUNITY_IMAGE_ID}"
+    fi
+fi
+
+echo "Resolved Pod VM Image ID:"
+echo "  ${PODVM_IMAGE_ID}"
 
 echo "Waiting for SSH..."
 SSH_READY=0
@@ -453,7 +593,7 @@ scp "${SSH_OPTS[@]}" -q "${REMOTE_SCRIPT_FILE}" \
 echo "Running Sealed Secret setup and verification on ${INSTANCE_NAME}..."
 echo "------------------------------------------------------"
 if ! ssh "${SSH_OPTS[@]}" -t "${ADMIN_USER}@${EXTERNAL_IP}" \
-    "WORKSPACE='${WORKSPACE}' TEST_POD_NAME='${TEST_POD_NAME}' TEST_POD_TIMEOUT='${TEST_POD_TIMEOUT}' bash /tmp/setup-sealed-secret.sh"; then
+    "WORKSPACE='${WORKSPACE}' TEST_POD_NAME='${TEST_POD_NAME}' TEST_POD_TIMEOUT='${TEST_POD_TIMEOUT}' KEEP_TEST_POD='${KEEP_TEST_POD}' PODVM_IMAGE_ID='${PODVM_IMAGE_ID}' bash /tmp/setup-sealed-secret.sh"; then
     echo "------------------------------------------------------"
     echo "ERROR: Sealed secret setup or verification failed on '${INSTANCE_NAME}'." >&2
     exit 1

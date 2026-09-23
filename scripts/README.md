@@ -217,6 +217,36 @@ To use PeerPods, set `runtimeClassName: kata-remote` in the pod manifest. The su
 kubectl apply -f scripts/03-coco/testCoCo.yaml
 ```
 
-## Common Caveats & Tips
+## Fast Setup (Skip Rebuilding)
 
-> Editorial note: The end of the supplied text was scrambled. The sample pod above was reconstructed from its identifiable YAML fields. The remaining fragments mention mount propagation, image pull policy, firewalld, IPv4-only CNI configuration, and PeerPod egress to Trustee/KBS, but their original instructions could not be reliably recovered.
+If you have already built the components (or restored a VM image where `/workspace` and pre-built artifacts exist), you can skip the time-consuming compilation phases (`02_build_kata.sh` and `01_build_coco.sh`) and initialize the running services directly.
+
+Run these three scripts in sequence:
+
+```bash
+# 1. Start CRI-O, etcd, and launch the local Kubernetes cluster
+./scripts/02-k8s-kata/01_setup_k8s_crio.sh
+
+# 2. Install pre-compiled Kata binaries and register the 'kata' RuntimeClass
+./scripts/02-k8s-kata/03_install_kata.sh
+
+# 3. Deploy Trustee Operator, Cloud API Adaptor daemon, and the 'kata-remote' RuntimeClass
+./scripts/03-coco/02_setup_peerpods.sh
+```
+
+## Parameters to build with local kata changes
+
+Use this command to build the kata binary on the host:
+```bash
+USE_CACHE=no make \
+    -C /workspace/kata-containers/tools/packaging/kata-deploy/local-build \
+    agent-tarball
+```
+
+Add these to your global.env file or pass them as environment variables:
+```bash
+BUILD_PODVM=1
+PUBLISH_PODVM=1
+PODVM_LOCAL_AGENT=/workspace/kata-containers/tools/packaging/kata-deploy/local-build/build/agent/destdir/usr/bin/kata-agent
+PODVM_DEBUG=1
+```

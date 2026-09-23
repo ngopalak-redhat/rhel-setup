@@ -110,10 +110,6 @@ CREATE_SP="${CREATE_SP:-1}"
 
 DISABLE_CVM="${DISABLE_CVM:-0}"
 USE_PUBLIC_IP="${USE_PUBLIC_IP:-0}"
-PODVM_NAT_GATEWAY="${PODVM_NAT_GATEWAY:-1}"
-
-NAT_GATEWAY_NAME="${NAT_GATEWAY_NAME:-${INSTANCE_NAME}-podvm-nat}"
-NAT_GATEWAY_IP_NAME="${NAT_GATEWAY_IP_NAME:-${INSTANCE_NAME}-podvm-nat-ip}"
 CAA_EXTRA_ARGS="${CAA_EXTRA_ARGS:-}"
 
 DELETE_AFTER=$(date -u -v+3d +"%Y-%m-%d" 2>/dev/null || date -u -d "+3 days" +"%Y-%m-%d")
@@ -153,6 +149,7 @@ CAA_UNIT=/etc/systemd/system/cloud-api-adaptor.service
 CAA_SOCKET=/run/peerpod/hypervisor.sock
 USE_TRUSTEE="${USE_TRUSTEE:-0}"
 TEST_ATTESTATION="${TEST_ATTESTATION:-0}"
+PODVM_IMAGE_ID="${PODVM_IMAGE_ID:-}"
 
 KBS_SMOKE_PATH="${KBS_SMOKE_PATH:-default/peerpod/smoke}"
 KBS_SMOKE_GUEST_PATH=/run/confidential-containers/cdh/kbs/peerpod/smoke
@@ -411,8 +408,8 @@ EOF
         --dry-run=client -o yaml | "${KUBE[@]}" apply -f -
     echo "  kbs:///${KBS_SMOKE_PATH} <- secret/${KBS_SECRET_NAME} key ${KBS_SECRET_KEY}"
 
-    log "Creating the KbsConfig"
-    "${KUBE[@]}" apply -f - <<EOF
+    log "Creating or updating the KbsConfig"
+    "${KUBE[@]}" apply --server-side --force-conflicts -f - <<EOF
 apiVersion: confidentialcontainers.org/v1alpha1
 kind: KbsConfig
 metadata:
@@ -788,6 +785,34 @@ EOF
         sudo journalctl -u cloud-api-adaptor.service --no-pager -n 200 \
             | grep -iE 'created an instance|instance id|podvm-' | tail -5 \
             || echo "  (nothing matched in the daemon log)"
+
+        log "Verifying CAA daemon logs for Pod VM image ID usage"
+        sudo journalctl -u cloud-api-adaptor.service --no-pager -n 500 | grep -iE 'CreateInstance|image_id|ImageID|Creating instance' || true
+
+        if [ -n "${PODVM_IMAGE_ID:-}" ]; then
+            log "Asserting daemon ImageID match against PODVM_IMAGE_ID"
+
+            ACTIVE_DAEMON_IMAGE="$(sudo journalctl -u cloud-api-adaptor.service --no-pager | grep 'ImageID:' | tail -1 | python3 -c '
+import sys, re
+line = sys.stdin.read()
+m = re.search(r"ImageID:([^\s\}]+)", line)
+print(m.group(1) if m else "")
+' || true)"
+
+            if [ -z "${ACTIVE_DAEMON_IMAGE}" ] && sudo test -f "${PEERPODS_CONF_DIR}/peer-pods.env"; then
+                ACTIVE_DAEMON_IMAGE="$(sudo sed -n 's/^AZURE_IMAGE_ID=//p' "${PEERPODS_CONF_DIR}/peer-pods.env" | tr -d '\r\n')"
+            fi
+
+            echo "  Expected PODVM_IMAGE_ID : ${PODVM_IMAGE_ID}"
+            echo "  Daemon Active Image ID  : ${ACTIVE_DAEMON_IMAGE}"
+
+            if [ "${ACTIVE_DAEMON_IMAGE}" != "${PODVM_IMAGE_ID}" ]; then
+                echo "ERROR: Image ID used by CAA daemon (${ACTIVE_DAEMON_IMAGE}) does NOT match PODVM_IMAGE_ID (${PODVM_IMAGE_ID})!" >&2
+                exit 1
+            else
+                echo "  SUCCESS: Confirmed daemon launched Pod VM using exact PODVM_IMAGE_ID."
+            fi
+        fi
     else
         log "The pod did not become Ready"
         "${KUBE[@]}" describe pod "${TEST_POD_NAME}" 2>/dev/null | tail -30 || true
@@ -912,37 +937,7 @@ else
     echo "  KBS            disabled (USE_TRUSTEE=${USE_TRUSTEE})"
 fi
 
-# --- B. Give the subnet an outbound path ---
-
-echo
-if [ "${PODVM_NAT_GATEWAY}" != "1" ]; then
-    echo "Outbound: skipped (PODVM_NAT_GATEWAY=${PODVM_NAT_GATEWAY})."
-else
-    EXISTING_NAT=$(az network vnet subnet show --ids "${SUBNET_ID}" \
-        --query "natGateway.id" --output tsv 2>/dev/null || true)
-    [ "${EXISTING_NAT}" = "None" ] && EXISTING_NAT=""
-
-    if [ -n "${EXISTING_NAT}" ]; then
-        echo "Outbound: ${SUBNET_ID##*/} already routes through ${EXISTING_NAT##*/}."
-    else
-        echo "Outbound: giving ${SUBNET_ID##*/} a NAT gateway..."
-        az network public-ip create --resource-group "${RESOURCE_GROUP}" \
-            --name "${NAT_GATEWAY_IP_NAME}" --location "${AZURE_REGION}" \
-            --sku Standard ${VM_TAGS[@]+--tags "${VM_TAGS[@]}"} --output none \
-            || fail "could not create the NAT gateway's public IP '${NAT_GATEWAY_IP_NAME}'."
-        az network nat gateway create --resource-group "${RESOURCE_GROUP}" \
-            --name "${NAT_GATEWAY_NAME}" --location "${AZURE_REGION}" \
-            --public-ip-addresses "${NAT_GATEWAY_IP_NAME}" \
-            ${VM_TAGS[@]+--tags "${VM_TAGS[@]}"} --output none \
-            || fail "could not create the NAT gateway '${NAT_GATEWAY_NAME}'."
-        az network vnet subnet update --ids "${SUBNET_ID}" \
-            --nat-gateway "${NAT_GATEWAY_NAME}" --output none \
-            || fail "could not attach '${NAT_GATEWAY_NAME}' to ${SUBNET_ID##*/}."
-        echo "          ${NAT_GATEWAY_NAME} attached."
-    fi
-fi
-
-# --- C. Check the pod VM size is usable here ---
+# --- B. Check the pod VM size is usable here ---
 
 echo
 echo "Checking ${PODVM_SIZE} in ${AZURE_REGION}..."
@@ -955,8 +950,7 @@ if [ "$(echo "${SKU_JSON}" | python3 -c 'import json,sys; print(len(json.load(sy
 fi
 
 CC_TYPE=$(echo "${SKU_JSON}" | python3 -c '
-import json,sys
-s = json.load(sys.stdin)[0]
+import json,sys; s = json.load(sys.stdin)[0]
 caps = {c["name"]: c["value"] for c in s.get("capabilities") or []}
 print(caps.get("ConfidentialComputingType", ""))' 2>/dev/null || true)
 SKU_FAMILY=$(echo "${SKU_JSON}" | python3 -c 'import json,sys; print(json.load(sys.stdin)[0].get("family",""))' 2>/dev/null || true)
@@ -978,7 +972,7 @@ if [ "${QUOTA_LIMIT:-0}" = "0" ]; then
     [ "${SKIP_QUOTA_CHECK:-0}" = "1" ] || exit 1
 fi
 
-# --- D. Service principal ---
+# --- C. Service principal ---
 
 echo "Checking Azure credentials..."
 SP_NAME="${INSTANCE_NAME}-peerpods"
@@ -1025,7 +1019,7 @@ else
     exit 1
 fi
 
-# --- E. Resolve the pod VM image ---
+# --- D. Resolve the pod VM image ---
 
 echo
 COMMUNITY_IMAGE_ID="/CommunityGalleries/${COCO_COMMUNITY_GALLERY}/Images/${PODVM_IMAGE_DEF_SRC}/Versions/${PODVM_IMAGE_VER_SRC}"
@@ -1099,7 +1093,7 @@ else
     fi
 fi
 
-# --- F. Reach the host ---
+# --- E. Reach the host ---
 
 echo
 echo "Waiting for SSH..."

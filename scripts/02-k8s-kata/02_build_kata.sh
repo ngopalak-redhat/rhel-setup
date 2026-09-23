@@ -1,11 +1,7 @@
 #!/bin/bash
 
 # Installs Kata Containers on the RHEL 9 host already configured as a CRI-O build box
-# by 01_setup_k8s_crio.sh[cite: 6].
-#
-# This script assumes that one has run to completion: CRI-O built and running under
-# systemd, the Kubernetes source tree in place, and local-up-cluster.sh serving a
-# cluster[cite: 6]. It verifies those before touching anything[cite: 6].
+# by 01_setup_k8s_crio.sh.
 #
 # usage: 02_build_kata.sh [-c <config-file>] [<config-file>]
 
@@ -242,9 +238,11 @@ fi
 log "Fetching Kata source"
 if [ -d "${KATA_SRC}/.git" ]; then
     echo "Repository already present; fetching updates."
+    sudo chown -R "${RUN_USER}:${RUN_USER}" "${KATA_SRC}"
     git -C "${KATA_SRC}" fetch --all --tags --prune
 else
     git clone "${KATA_REPO}" "${KATA_SRC}"
+    sudo chown -R "${RUN_USER}:${RUN_USER}" "${KATA_SRC}"
 fi
 if [ -n "${KATA_REF}" ]; then
     echo "Checking out ${KATA_REF}"
@@ -299,6 +297,8 @@ go version
 # --- 5. Build the runtime ---
 
 log "Building the Kata runtime (go)"
+# Reclaim ownership of any root-built config artifacts from previous install runs
+sudo chown -R "${RUN_USER}:${RUN_USER}" "${KATA_SRC}"
 pushd "${KATA_SRC}/src/runtime" > /dev/null
 make
 popd > /dev/null
@@ -366,7 +366,6 @@ echo "rootfs:        ${ROOTFS_DIR}"
 echo "guest image:   ${KATA_SRC}/tools/osbuilder/image-builder/kata-containers.img"
 echo "guest kernel:  $(find "${KATA_SRC}/tools/packaging/kernel" -maxdepth 5 -path '*/arch/x86/boot/bzImage' 2>/dev/null | head -1 || echo 'NOT BUILT')"
 echo "guest vmlinux: $(find "${KATA_SRC}/tools/packaging/kernel" -maxdepth 2 -name vmlinux 2>/dev/null | head -1 || echo 'NOT BUILT')"
-echo
 echo "NOT installed yet (deliberately): runtime binaries, /etc/kata-containers/configuration.toml,"
 echo "/usr/share/kata-containers/kata-containers.img and the guest kernel."
 REMOTE_SCRIPT
@@ -438,6 +437,5 @@ echo "------------------------------------------------------"
 echo "Kata build complete on '${INSTANCE_NAME}'."
 echo "Kata source:   ${WORKSPACE}/kata-containers"
 echo "Rust toolchain: ${RUST_ROOT}"
-echo
 echo "Nothing has been installed into a system directory yet."
 echo "SSH: ssh ${ADMIN_USER}@${EXTERNAL_IP}"

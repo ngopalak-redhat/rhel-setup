@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Clones and builds Confidential Containers repositories on the RHEL 9 host, under
-# /workspace/confidential-containers/<repo>[cite: 8].
+# /workspace/confidential-containers/<repo>.
 #
 # usage: 01_build_coco.sh [-c <config-file>] [<config-file>]
 
@@ -97,6 +97,8 @@ D2_VERSION="${D2_VERSION:-v0.8.1}"
 BUILD_PODVM="${BUILD_PODVM:-1}"
 PODVM_KATA_REF="${PODVM_KATA_REF:-}"
 PODVM_LOCAL_AGENT="${PODVM_LOCAL_AGENT:-}"
+PODVM_DEBUG="${PODVM_DEBUG:-0}"
+PODVM_SSH_PUBLIC_KEY="${PODVM_SSH_PUBLIC_KEY:-}"
 PODVM_TEE_PLATFORM="${PODVM_TEE_PLATFORM:-az-cvm-vtpm}"
 DOCKER_DATA_ROOT="${DOCKER_DATA_ROOT:-${WORKSPACE}/docker}"
 CONTAINERD_DATA_ROOT="${CONTAINERD_DATA_ROOT:-${WORKSPACE}/containerd}"
@@ -110,6 +112,10 @@ PODVM_STORAGE_ACCOUNT="${PODVM_STORAGE_ACCOUNT:-${RESOURCE_GROUP}podvm}"
 PODVM_STORAGE_CONTAINER="${PODVM_STORAGE_CONTAINER:-podvm}"
 PODVM_IDENTITY_ROLE="${PODVM_IDENTITY_ROLE:-Contributor}"
 
+PODVM_NAT_GATEWAY="${PODVM_NAT_GATEWAY:-1}"
+NAT_GATEWAY_NAME="${NAT_GATEWAY_NAME:-${INSTANCE_NAME}-podvm-nat}"
+NAT_GATEWAY_IP_NAME="${NAT_GATEWAY_IP_NAME:-${INSTANCE_NAME}-podvm-nat-ip}"
+
 DELETE_AFTER=$(date -u -v+3d +"%Y-%m-%d" 2>/dev/null || date -u -d "+3 days" +"%Y-%m-%d")
 
 VM_TAGS=(
@@ -122,6 +128,62 @@ SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="${HOME}/.ss
 [ -f "${SSH_KEY}" ] && SSH_OPTS+=(-i "${SSH_KEY}")
 
 # --- Functions ---
+
+ensure_nat_gateway() {
+    if [ "${PODVM_NAT_GATEWAY}" != "1" ]; then
+        echo "Outbound NAT Gateway: skipped (PODVM_NAT_GATEWAY=${PODVM_NAT_GATEWAY})."
+        return 0
+    fi
+
+    if ! az account show > /dev/null 2>&1; then
+        echo "WARNING: Not logged in to Azure; skipping NAT Gateway setup."
+        return 0
+    fi
+
+    echo "Checking outbound NAT gateway setup for '${INSTANCE_NAME}'..."
+    local vm_json location nic_id subnet_id existing_nat
+    vm_json=$(az vm show --resource-group "${RESOURCE_GROUP}" --name "${INSTANCE_NAME}" \
+        --show-details --output json 2>/dev/null || true)
+
+    if [ -z "${vm_json}" ]; then
+        echo "ERROR: could not find VM '${INSTANCE_NAME}' in resource group '${RESOURCE_GROUP}'." >&2
+        exit 1
+    fi
+
+    location=$(echo "${vm_json}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["location"])')
+    nic_id=$(echo "${vm_json}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["networkProfile"]["networkInterfaces"][0]["id"])')
+
+    subnet_id=$(az network nic show --ids "${nic_id}" \
+        --query "ipConfigurations[0].subnet.id" --output tsv 2>/dev/null || true)
+
+    if [ -z "${subnet_id}" ]; then
+        echo "ERROR: could not determine subnet ID for '${INSTANCE_NAME}'." >&2
+        exit 1
+    fi
+
+    existing_nat=$(az network vnet subnet show --ids "${subnet_id}" \
+        --query "natGateway.id" --output tsv 2>/dev/null || true)
+    [ "${existing_nat}" = "None" ] && existing_nat=""
+
+    if [ -n "${existing_nat}" ]; then
+        echo "Outbound NAT: Subnet ${subnet_id##*/} already routes through ${existing_nat##*/}."
+    else
+        echo "Outbound NAT: attaching NAT gateway to ${subnet_id##*/}..."
+        az network public-ip create --resource-group "${RESOURCE_GROUP}" \
+            --name "${NAT_GATEWAY_IP_NAME}" --location "${location}" \
+            --sku Standard ${VM_TAGS[@]+--tags "${VM_TAGS[@]}"} --output none \
+            || { echo "ERROR: could not create NAT gateway public IP '${NAT_GATEWAY_IP_NAME}'." >&2; exit 1; }
+        az network nat gateway create --resource-group "${RESOURCE_GROUP}" \
+            --name "${NAT_GATEWAY_NAME}" --location "${location}" \
+            --public-ip-addresses "${NAT_GATEWAY_IP_NAME}" \
+            ${VM_TAGS[@]+--tags "${VM_TAGS[@]}"} --output none \
+            || { echo "ERROR: could not create NAT gateway '${NAT_GATEWAY_NAME}'." >&2; exit 1; }
+        az network vnet subnet update --ids "${subnet_id}" \
+            --nat-gateway "${NAT_GATEWAY_NAME}" --output none \
+            || { echo "ERROR: could not attach '${NAT_GATEWAY_NAME}' to ${subnet_id##*/}." >&2; exit 1; }
+        echo "          ${NAT_GATEWAY_NAME} attached."
+    fi
+}
 
 write_remote_script() {
     cat > "$1" <<'REMOTE_SCRIPT'
@@ -145,6 +207,8 @@ D2_VERSION="${D2_VERSION:-v0.8.1}"
 BUILD_PODVM="${BUILD_PODVM:-1}"
 PODVM_KATA_REF="${PODVM_KATA_REF:-}"
 PODVM_LOCAL_AGENT="${PODVM_LOCAL_AGENT:-}"
+PODVM_DEBUG="${PODVM_DEBUG:-0}"
+PODVM_SSH_PUBLIC_KEY="${PODVM_SSH_PUBLIC_KEY:-}"
 PODVM_TEE_PLATFORM="${PODVM_TEE_PLATFORM:-az-cvm-vtpm}"
 DOCKER_DATA_ROOT="${DOCKER_DATA_ROOT:-${WORKSPACE}/docker}"
 CONTAINERD_DATA_ROOT="${CONTAINERD_DATA_ROOT:-${WORKSPACE}/containerd}"
@@ -329,7 +393,9 @@ build_trustee_operator() {
     ARTIFACTS+=("trustee-operator manager|${src}/bin/manager")
 
     log "Building the trustee-operator image as ${TRUSTEE_OPERATOR_IMAGE}"
-    sudo podman build -t "${TRUSTEE_OPERATOR_IMAGE}" "${src}"
+    # Use host networking for build-time downloads: the Podman bridge can
+    # lose DNS connectivity on this host alongside Docker and Kubernetes.
+    sudo podman build --network=host -t "${TRUSTEE_OPERATOR_IMAGE}" "${src}"
 
     if command -v crictl > /dev/null 2>&1 \
         && sudo crictl images 2>/dev/null | grep -q 'trustee-operator'; then
@@ -491,6 +557,27 @@ build_podvm() {
     local podvm="${src}/podvm"
     local tree_agent="${podvm}/resources/binaries-tree/usr/local/bin/kata-agent"
 
+    local image_target=image
+    case "${PODVM_DEBUG}" in
+        0) ;;
+        1)
+            local public_key="${PODVM_SSH_PUBLIC_KEY:-${HOME}/.ssh/id_rsa.pub}"
+            if [ ! -f "${public_key}" ] || ! ssh-keygen -lf "${public_key}" > /dev/null 2>&1; then
+                echo "ERROR: set PODVM_SSH_PUBLIC_KEY to a valid public-key file on the build VM."
+                exit 1
+            fi
+            if grep -q 'PRIVATE KEY' "${public_key}"; then
+                echo "ERROR: PODVM_SSH_PUBLIC_KEY must contain only a public key."
+                exit 1
+            fi
+            mkdir -p "${podvm}/resources"
+            install -m 0400 "${public_key}" "${podvm}/resources/authorized_keys"
+            image_target=image-debug
+            echo "Building an SSH-enabled debug image; login user: root"
+            ;;
+        *) echo "ERROR: PODVM_DEBUG must be 0 or 1."; exit 1 ;;
+    esac
+
     log "Preparing the pod VM image build"
     setup_go_env
     ensure_yq
@@ -557,7 +644,11 @@ EOF
         export TEE_PLATFORM="${PODVM_TEE_PLATFORM}"
 
         if [ -z "${agent}" ]; then
-            sg docker -c "make -C '${podvm}'"
+            if [ "${PODVM_DEBUG}" = "1" ]; then
+                sg docker -c "make -C '${podvm}' debug"
+            else
+                sg docker -c "make -C '${podvm}'"
+            fi
         else
             sg docker -c "make -C '${podvm}' podvm-binaries"
             install -D -m 0755 "${agent}" "${tree_agent}"
@@ -565,7 +656,7 @@ EOF
             echo "  ${agent}"
             echo "  -> ${tree_agent}"
 
-            sg docker -c "make -C '${podvm}' image"
+            sg docker -c "make -C '${podvm}' ${image_target}"
         fi
     )
 
@@ -930,6 +1021,9 @@ fi
 
 echo "Target: ${ADMIN_USER}@${EXTERNAL_IP}"
 
+# Ensure NAT Gateway for host subnet outbound routing
+ensure_nat_gateway
+
 echo "Waiting for SSH..."
 SSH_READY=0
 for ATTEMPT in $(seq 1 30); do
@@ -982,7 +1076,7 @@ fi
 echo "------------------------------------------------------"
 
 if ! ssh "${SSH_OPTS[@]}" -t "${ADMIN_USER}@${EXTERNAL_IP}" \
-    "WORKSPACE='${WORKSPACE}' COCO_REPOS='${COCO_REPOS}' COCO_ORG_URL='${COCO_ORG_URL}' BUILD_TRUSTEE='${BUILD_TRUSTEE}' BUILD_TRUSTEE_OPERATOR='${BUILD_TRUSTEE_OPERATOR}' TRUSTEE_OPERATOR_IMAGE='${TRUSTEE_OPERATOR_IMAGE}' BUILD_CAA='${BUILD_CAA}' BUILD_DIAGRAMS='${BUILD_DIAGRAMS}' RUST_ROOT='${RUST_ROOT}' KBS_AS_FEATURE='${KBS_AS_FEATURE}' SGX_VERSION='${SGX_VERSION}' SGX_REPO_URL='${SGX_REPO_URL}' D2_VERSION='${D2_VERSION}' BUILD_PODVM='${BUILD_PODVM}' PODVM_KATA_REF='${PODVM_KATA_REF}' PODVM_LOCAL_AGENT='${PODVM_LOCAL_AGENT}' PODVM_TEE_PLATFORM='${PODVM_TEE_PLATFORM}' DOCKER_DATA_ROOT='${DOCKER_DATA_ROOT}' CONTAINERD_DATA_ROOT='${CONTAINERD_DATA_ROOT}' PUBLISH_PODVM='${PUBLISH_PODVM}' PODVM_BUILD_GALLERY='${PODVM_BUILD_GALLERY}' PODVM_BUILD_IMAGE_DEF='${PODVM_BUILD_IMAGE_DEF}' PODVM_BUILD_IMAGE_VERSION='${PODVM_BUILD_IMAGE_VERSION}' PODVM_BUILD_LOCATION='${PODVM_BUILD_LOCATION}' PODVM_STORAGE_ACCOUNT='${PODVM_STORAGE_ACCOUNT}' PODVM_STORAGE_CONTAINER='${PODVM_STORAGE_CONTAINER}' PODVM_TAGS='${PODVM_TAGS}' AZURE_SUBSCRIPTION_ID='${AZURE_SUBSCRIPTION_ID}' AZURE_RESOURCE_GROUP='${RESOURCE_GROUP}' bash /tmp/build-coco.sh"; then
+    "WORKSPACE='${WORKSPACE}' COCO_REPOS='${COCO_REPOS}' COCO_ORG_URL='${COCO_ORG_URL}' BUILD_TRUSTEE='${BUILD_TRUSTEE}' BUILD_TRUSTEE_OPERATOR='${BUILD_TRUSTEE_OPERATOR}' TRUSTEE_OPERATOR_IMAGE='${TRUSTEE_OPERATOR_IMAGE}' BUILD_CAA='${BUILD_CAA}' BUILD_DIAGRAMS='${BUILD_DIAGRAMS}' RUST_ROOT='${RUST_ROOT}' KBS_AS_FEATURE='${KBS_AS_FEATURE}' SGX_VERSION='${SGX_VERSION}' SGX_REPO_URL='${SGX_REPO_URL}' D2_VERSION='${D2_VERSION}' BUILD_PODVM='${BUILD_PODVM}' PODVM_KATA_REF='${PODVM_KATA_REF}' PODVM_LOCAL_AGENT='${PODVM_LOCAL_AGENT}' PODVM_DEBUG='${PODVM_DEBUG}' PODVM_SSH_PUBLIC_KEY='${PODVM_SSH_PUBLIC_KEY}' PODVM_TEE_PLATFORM='${PODVM_TEE_PLATFORM}' DOCKER_DATA_ROOT='${DOCKER_DATA_ROOT}' CONTAINERD_DATA_ROOT='${CONTAINERD_DATA_ROOT}' PUBLISH_PODVM='${PUBLISH_PODVM}' PODVM_BUILD_GALLERY='${PODVM_BUILD_GALLERY}' PODVM_BUILD_IMAGE_DEF='${PODVM_BUILD_IMAGE_DEF}' PODVM_BUILD_IMAGE_VERSION='${PODVM_BUILD_IMAGE_VERSION}' PODVM_BUILD_LOCATION='${PODVM_BUILD_LOCATION}' PODVM_STORAGE_ACCOUNT='${PODVM_STORAGE_ACCOUNT}' PODVM_STORAGE_CONTAINER='${PODVM_STORAGE_CONTAINER}' PODVM_TAGS='${PODVM_TAGS}' AZURE_SUBSCRIPTION_ID='${AZURE_SUBSCRIPTION_ID}' AZURE_RESOURCE_GROUP='${RESOURCE_GROUP}' bash /tmp/build-coco.sh"; then
     echo "------------------------------------------------------"
     echo "ERROR: failed on '${INSTANCE_NAME}'." >&2
     exit 1
